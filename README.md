@@ -10,12 +10,6 @@ This repository is a sanitized independent archive derived from:
 https://github.com/hgbhh258-spec/Sonic-Topography-Wallpaper
 ```
 
-That project states that it is based on:
-
-```text
-https://github.com/yin-yizhen/sonic-topography
-```
-
 Original copyright retained from the MIT license:
 
 ```text
