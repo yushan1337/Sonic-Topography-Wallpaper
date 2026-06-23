@@ -2,9 +2,9 @@
 
 Date: 2026-06-23
 
-## Source Relationship
+## Upstream Relationship
 
-This project was created from:
+This project is a sanitized independent archive derived from:
 
 ```text
 https://github.com/hgbhh258-spec/Sonic-Topography-Wallpaper
@@ -17,6 +17,8 @@ https://github.com/yin-yizhen/sonic-topography
 ```
 
 The original MIT license and copyright notice are retained in `LICENSE`.
+
+The GitHub-visible fork relationship is not preserved because this archive was rebuilt as a clean root commit to avoid carrying machine-specific local history. The upstream relationship is documented in `README.md` and in this file.
 
 ## Purpose
 

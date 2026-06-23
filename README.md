@@ -2,9 +2,9 @@
 
 A KDE desktop wallpaper adaptation of Sonic Topography Wallpaper. This version is built around a local Linux desktop workflow: YesPlayMusic provides the audio, PipeWire routes it into a visualizer source, a Python WebSocket backend streams FFT data and lyrics metadata, and the React/Three.js frontend renders the animated chessboard wave wallpaper.
 
-## Notice
+## Upstream
 
-This repository is based on:
+This repository is a sanitized independent archive derived from:
 
 ```text
 https://github.com/hgbhh258-spec/Sonic-Topography-Wallpaper
@@ -22,7 +22,7 @@ Original copyright retained from the MIT license:
 Copyright (c) 2026 eeegg
 ```
 
-This repository retains the original MIT License. The README has been rewritten for this KDE/YesPlayMusic adaptation, but the original `LICENSE` file is kept unchanged.
+This repository does not currently preserve GitHub's visible fork relationship because its history was rebuilt as a clean archive. The upstream relationship is documented here instead. The original MIT License is retained, and the original `LICENSE` file is kept unchanged.
 
 ## What Changed
 
