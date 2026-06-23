@@ -1,0 +1,162 @@
+#!/bin/bash
+set -u
+
+REAL_SINK="${SONIC_REAL_SINK:-alsa_output.pci-0000_06_00.6.analog-stereo}"
+VIZ_SINK="sonic_viz_sink"
+VIZ_SOURCE="sonic_viz_mic"
+HTTP_PORT="${SONIC_HTTP_PORT:-8000}"
+WS_PORT="${SONIC_WS_PORT:-8082}"
+LOG_DIR="${SONIC_LOG_DIR:-/tmp}"
+ROUTE_LOG="$LOG_DIR/sonic-route.log"
+LAUNCHER_SCRIPT="${SONIC_LAUNCHER_SCRIPT:-$HOME/.local/bin/sonic-wallpaper}"
+WS_SCRIPT="${SONIC_WS_SCRIPT:-$HOME/.local/bin/sonic-audio-ws}"
+WEB_ROOT="${SONIC_WEB_ROOT:-$HOME/www}"
+APP_PATH="${SONIC_APP_PATH:-/Sonic-Topography-Wallpaper/}"
+APP_URL="${SONIC_APP_URL:-http://localhost:${HTTP_PORT}${APP_PATH}}"
+CHROME_PROFILE="${SONIC_CHROME_PROFILE:-/tmp/sonic-wallpaper-chrome-profile}"
+
+log() {
+    printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$ROUTE_LOG"
+}
+
+ensure_audio_graph() {
+    if ! pactl list short sinks | awk '{print $2}' | grep -qx "$VIZ_SINK"; then
+        pactl load-module module-null-sink sink_name="$VIZ_SINK" sink_properties=device.description="$VIZ_SINK" >/dev/null
+        log "created sink $VIZ_SINK"
+    fi
+
+    if ! pactl list short sources | awk '{print $2}' | grep -qx "$VIZ_SOURCE"; then
+        pactl load-module module-remap-source source_name="$VIZ_SOURCE" master="${VIZ_SINK}.monitor" source_properties=device.description="$VIZ_SOURCE" >/dev/null
+        log "created source $VIZ_SOURCE"
+    fi
+
+    if ! pactl list short modules | grep -q "source=${VIZ_SINK}.monitor sink=${REAL_SINK}"; then
+        pactl load-module module-loopback source="${VIZ_SINK}.monitor" sink="$REAL_SINK" latency_msec=10 >/dev/null
+        log "created loopback ${VIZ_SINK}.monitor -> $REAL_SINK"
+    fi
+
+    pactl set-default-sink "$REAL_SINK" >/dev/null 2>&1 || true
+}
+
+route_audio_once() {
+    local yes_pids
+    yes_pids="$(ps -eo pid=,args= | awk '/\/opt\/YesPlayMusic\/yesplaymusic/ {print $1}' | tr '\n' ' ')"
+    pactl list sink-inputs 2>/dev/null | awk '
+        /^Sink Input #/ {
+            if (id != "") print id "|" sink "|" app "|" binary "|" node "|" pid
+            id = substr($3, 2); sink = ""; app = ""; binary = ""; node = ""; pid = ""
+        }
+        /^\tSink: / { sink = $2 }
+        /application.name = / {
+            app = $0
+            sub(/^.*application.name = "/, "", app)
+            sub(/"$/, "", app)
+        }
+        /application.process.binary = / {
+            binary = $0
+            sub(/^.*application.process.binary = "/, "", binary)
+            sub(/"$/, "", binary)
+        }
+        /application.process.id = / {
+            pid = $0
+            sub(/^.*application.process.id = "/, "", pid)
+            sub(/"$/, "", pid)
+        }
+        /node.name = / {
+            node = $0
+            sub(/^.*node.name = "/, "", node)
+            sub(/"$/, "", node)
+        }
+        END {
+            if (id != "") print id "|" sink "|" app "|" binary "|" node "|" pid
+        }
+    ' | while IFS='|' read -r id sink app binary node pid; do
+        [ -z "$id" ] && continue
+        local is_yes="0"
+        case "$binary:$app:$node" in
+            *yesplaymusic*|*YesPlayMusic*) is_yes="1" ;;
+        esac
+        if [ "$is_yes" = "0" ] && [ -n "$pid" ]; then
+            case " $yes_pids " in
+                *" $pid "*) is_yes="1" ;;
+            esac
+        fi
+        case "$binary:$app:$node" in
+            *)
+                if [ "$is_yes" = "1" ]; then
+                if [ "$sink" != "$(pactl list short sinks | awk -v n="$VIZ_SINK" '$2 == n {print $1; exit}')" ]; then
+                        pactl move-sink-input "$id" "$VIZ_SINK" >/dev/null 2>&1 && log "moved YesPlayMusic stream #$id pid=$pid app=$app binary=$binary to $VIZ_SINK"
+                fi
+                else
+                if [ "$sink" = "$(pactl list short sinks | awk -v n="$VIZ_SINK" '$2 == n {print $1; exit}')" ]; then
+                    pactl move-sink-input "$id" "$REAL_SINK" >/dev/null 2>&1 && log "moved non-music stream #$id ($app/$binary) to $REAL_SINK"
+                fi
+                fi
+            ;;
+        esac
+    done
+}
+
+start_router() {
+    if command -v systemd-run >/dev/null 2>&1; then
+        systemctl --user stop sonic-route-loop >/dev/null 2>&1 || true
+        systemd-run --user --unit=sonic-route-loop /bin/bash -lc "while true; do \"$LAUNCHER_SCRIPT\" --route-once; sleep 1; done" >/dev/null 2>&1
+    else
+        (
+            exec -a sonic-wallpaper-route-loop bash -c "
+                while true; do
+                    \"$LAUNCHER_SCRIPT\" --route-once
+                    sleep 1
+                done
+            "
+        ) >/dev/null 2>&1 &
+    fi
+}
+
+start_ws() {
+    if command -v systemd-run >/dev/null 2>&1; then
+        systemctl --user stop sonic-audio-ws >/dev/null 2>&1 || true
+        systemd-run --user --unit=sonic-audio-ws --same-dir /usr/bin/python3 -u "$WS_SCRIPT" >/dev/null 2>&1 || \
+            nohup python3 -u "$WS_SCRIPT" > "$LOG_DIR/sonic-audio-ws.log" 2>&1 &
+    else
+        pkill -f "$WS_SCRIPT" >/dev/null 2>&1 || true
+        nohup python3 -u "$WS_SCRIPT" > "$LOG_DIR/sonic-audio-ws.log" 2>&1 &
+    fi
+}
+
+start_http() {
+    pgrep -f "http.server ${HTTP_PORT}" >/dev/null 2>&1 || \
+        nohup python3 -m http.server "$HTTP_PORT" --directory "$WEB_ROOT" >/dev/null 2>&1 &
+}
+
+start_chrome() {
+    mkdir -p "$CHROME_PROFILE"
+    google-chrome-stable \
+        --new-window \
+        --app="$APP_URL" \
+        --user-data-dir="$CHROME_PROFILE" \
+        --no-first-run \
+        --no-default-browser-check \
+        --window-size=2560,1600 \
+        --window-position=0,0 \
+        >/dev/null 2>&1 &
+}
+
+if [ "${1:-}" = "--route-once" ]; then
+    route_audio_once
+    exit 0
+fi
+
+log "starting sonic wallpaper fullauto"
+ensure_audio_graph
+route_audio_once
+start_router
+start_ws
+start_http
+
+for i in {1..20}; do
+    curl -s "$APP_URL" >/dev/null 2>&1 && break
+    sleep 0.5
+done
+
+start_chrome

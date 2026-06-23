@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Sonic Wallpaper
+Comment=棋盘海浪音乐律动壁纸
+Icon=audio-speakers
+Exec=sonic-wallpaper
+Terminal=false

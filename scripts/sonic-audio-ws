@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Capture system audio, compute FFT, stream frequency and lyrics data via WebSocket."""
+import asyncio
+import json
+import numpy as np
+import re
+import sounddevice as sd
+import subprocess
+import urllib.parse
+import urllib.request
+import websockets
+
+SAMPLE_RATE = None
+FFT_SIZE = 4096
+OUTPUT_BINS = 512
+VIRTUAL_SAMPLE_RATE = 48000
+PORT = 8082
+DB_FLOOR = -78.0
+DB_CEIL = -12.0
+NOISE_GATE_RMS = 0.0008
+SMOOTHING = 0.35
+OUTPUT_GAIN = 1.15
+MIN_RMS_ACTIVE = 0.002
+MIN_PEAK_ACTIVE = 0.015
+SUBSONIC_BIN_CUTOFF = 2
+
+connected = set()
+loop = None
+smoothed_bins = np.zeros(OUTPUT_BINS, dtype=np.float32)
+target_freqs = np.arange(OUTPUT_BINS, dtype=np.float32) * (VIRTUAL_SAMPLE_RATE / 2.0) / OUTPUT_BINS
+lyrics_cache = {}
+last_lyrics_payload = None
+
+def unescape_busctl_text(value):
+    return (
+        value.replace(r"\\", "\\")
+        .replace(r"\"", '"')
+        .replace(r"\n", "\n")
+        .replace(r"\t", "\t")
+    )
+
+def audio_callback(indata, frames, time, status):
+    global smoothed_bins
+    if not connected or loop is None:
+        return
+    mono = indata.mean(axis=1).astype(np.float32) if indata.ndim > 1 else indata.astype(np.float32)
+    mono = mono - float(np.mean(mono))
+    rms = float(np.sqrt(np.mean(mono * mono)))
+    window = np.hanning(len(mono))
+    fft = np.abs(np.fft.rfft(mono * window, n=FFT_SIZE))
+    fft = fft / (np.sum(window) / 2.0)
+    db_raw = 20.0 * np.log10(fft + 1e-9)
+    source_freqs = np.arange(len(db_raw), dtype=np.float32) * (SAMPLE_RATE / FFT_SIZE)
+    db = np.interp(target_freqs, source_freqs, db_raw)
+    bins = np.clip((db - DB_FLOOR) / (DB_CEIL - DB_FLOOR), 0.0, 1.0)
+
+    if rms < NOISE_GATE_RMS:
+        bins *= rms / NOISE_GATE_RMS
+
+    bins = bins.astype(np.float32)
+    bins[:SUBSONIC_BIN_CUTOFF] = 0.0
+    bins = np.clip(bins * OUTPUT_GAIN, 0.0, 1.0)
+    if rms < MIN_RMS_ACTIVE and float(np.max(bins)) < MIN_PEAK_ACTIVE:
+        bins *= 0.0
+    smoothed_bins = smoothed_bins * SMOOTHING + bins.astype(np.float32) * (1.0 - SMOOTHING)
+    data = np.clip(smoothed_bins * 255.0, 0, 255).astype(np.uint8).tobytes()
+    for ws in connected.copy():
+        asyncio.run_coroutine_threadsafe(safe_send(ws, data), loop)
+
+async def safe_send(ws, data):
+    try:
+        await ws.send(data)
+    except:
+        connected.discard(ws)
+
+def run_busctl_property(prop):
+    return subprocess.check_output(
+        [
+            "busctl",
+            "--user",
+            "get-property",
+            "org.mpris.MediaPlayer2.yesplaymusic",
+            "/org/mpris/MediaPlayer2",
+            "org.mpris.MediaPlayer2.Player",
+            prop,
+        ],
+        text=True,
+        stderr=subprocess.DEVNULL,
+        timeout=1.5,
+    ).strip()
+
+def parse_busctl_string(value):
+    match = re.search(r's\s+"(.*)"$', value)
+    return unescape_busctl_text(match.group(1)) if match else ""
+
+def parse_metadata(raw):
+    def string_field(key):
+        match = re.search(rf'"{re.escape(key)}"\s+\w+\s+"([^"]*)"', raw)
+        return unescape_busctl_text(match.group(1)) if match else ""
+
+    artist_match = re.search(r'"xesam:artist"\s+as\s+(\d+)\s+((?:"[^"]+"\s*)+)', raw)
+    artists = []
+    if artist_match:
+        artist_count = int(artist_match.group(1))
+        artists = [
+            unescape_busctl_text(item)
+            for item in re.findall(r'"([^"]*)"', artist_match.group(2))[:artist_count]
+        ]
+
+    url = string_field("xesam:url")
+    id_match = re.search(r"/trackid/(\d+)", url)
+    length_match = re.search(r'"mpris:length"\s+x\s+(\d+)', raw)
+
+    return {
+        "trackId": id_match.group(1) if id_match else "",
+        "title": string_field("xesam:title"),
+        "artist": " / ".join(artists),
+        "album": string_field("xesam:album"),
+        "artUrl": string_field("mpris:artUrl"),
+        "duration": int(length_match.group(1)) / 1000000.0 if length_match else 0,
+    }
+
+def fetch_lyrics(track_id):
+    if not track_id:
+        return ""
+    if track_id in lyrics_cache:
+        return lyrics_cache[track_id]
+
+    query = urllib.parse.urlencode({"id": track_id, "lv": 1, "kv": 1, "tv": -1})
+    url = f"https://music.163.com/api/song/lyric?{query}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://music.163.com/",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        lyric = (data.get("lrc") or {}).get("lyric") or ""
+    except Exception:
+        lyric = ""
+
+    lyrics_cache[track_id] = lyric
+    return lyric
+
+def read_lyrics_payload():
+    metadata = parse_metadata(run_busctl_property("Metadata"))
+    status = parse_busctl_string(run_busctl_property("PlaybackStatus"))
+    position_raw = run_busctl_property("Position")
+    position_match = re.search(r"x\s+(\d+)", position_raw)
+    position = int(position_match.group(1)) / 1000000.0 if position_match else 0
+    lyric = fetch_lyrics(metadata["trackId"])
+
+    return {
+        "type": "lyrics",
+        "trackId": metadata["trackId"],
+        "title": metadata["title"],
+        "artist": metadata["artist"],
+        "album": metadata["album"],
+        "artUrl": metadata["artUrl"],
+        "duration": metadata["duration"],
+        "currentTime": position,
+        "isPlaying": status == "Playing",
+        "lrcText": lyric,
+    }
+
+async def lyrics_broadcaster():
+    global last_lyrics_payload
+    while True:
+        await asyncio.sleep(0.5)
+        if not connected:
+            continue
+        try:
+            payload = await asyncio.to_thread(read_lyrics_payload)
+        except Exception:
+            payload = {
+                "type": "lyrics",
+                "trackId": "",
+                "title": "",
+                "artist": "",
+                "album": "",
+                "artUrl": "",
+                "duration": 0,
+                "currentTime": 0,
+                "isPlaying": False,
+                "lrcText": "",
+            }
+
+        # Always send position updates, but avoid rebuilding the JSON elsewhere.
+        last_lyrics_payload = payload
+        data = json.dumps(payload, ensure_ascii=False)
+        for ws in connected.copy():
+            asyncio.create_task(safe_send(ws, data))
+
+async def handler(websocket):
+    connected.add(websocket)
+    try:
+        async for _ in websocket:
+            pass  # keep connection alive
+    finally:
+        connected.discard(websocket)
+
+async def main():
+    global loop
+    loop = asyncio.get_running_loop()
+    # Find sonic_viz device
+    devices = sd.query_devices()
+    device_id = None
+    for i, d in enumerate(devices):
+        if 'sonic_viz_mic' in d['name']:
+            device_id = i
+            break
+    if device_id is None:
+        # Fallback: use PipeWire default input
+        for i, d in enumerate(devices):
+            if 'pipewire' in d['name'] and d['max_input_channels'] > 0:
+                device_id = i
+                break
+
+    sample_rate = int(devices[device_id].get('default_samplerate') or 48000)
+    globals()['SAMPLE_RATE'] = sample_rate
+
+    print(f"Using device [{device_id}]: {devices[device_id]['name']}")
+    print(f"Sample rate: {sample_rate}")
+    print(f"FFT size: {FFT_SIZE}, output bins: {OUTPUT_BINS}, virtual sample rate: {VIRTUAL_SAMPLE_RATE}")
+    print(f"Audio WebSocket server on ws://127.0.0.1:{PORT}")
+    print("Lyrics bridge: org.mpris.MediaPlayer2.yesplaymusic -> NetEase LRC")
+
+    stream = sd.InputStream(
+        device=device_id,
+        samplerate=sample_rate,
+        blocksize=FFT_SIZE,
+        channels=2,
+        callback=audio_callback,
+    )
+    stream.start()
+    asyncio.create_task(lyrics_broadcaster())
+    async with websockets.serve(handler, "127.0.0.1", PORT):
+        await asyncio.Future()
+
+if __name__ == "__main__":
+    asyncio.run(main())
